@@ -24,7 +24,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-
+import pdb
 import datasets
 import numpy as np
 from datasets import ClassLabel, load_dataset, load_metric
@@ -46,6 +46,8 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
+from modeling_bert import BertReverseLayer
+import torch.nn as nn
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.19.0.dev0")
@@ -352,6 +354,18 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
+    encoder = model.bert.encoder
+    config.reverse_layers = []
+    revised_modulelist = []
+    for idx, layer in enumerate(encoder.layer):
+        
+        if idx in config.reverse_layers:
+            layer = BertReverseLayer(config)
+        revised_modulelist.append(layer)
+    # import pdb; pdb.set_trace()
+    encoder.layer = nn.ModuleList(revised_modulelist)
+    print(model)
+    # pdb.set_trace()
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         raise ValueError(

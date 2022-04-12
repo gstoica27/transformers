@@ -25,13 +25,14 @@ import math
 import os
 import random
 from pathlib import Path
+import pdb
 
 import datasets
 import torch
 from datasets import ClassLabel, load_dataset, load_metric
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-
+import torch.nn as nn
 import transformers
 from accelerate import Accelerator
 from huggingface_hub import Repository
@@ -49,6 +50,9 @@ from transformers import (
     get_scheduler,
     set_seed,
 )
+import sys
+# sys.path.insert(1, '/nethome/gstoica3/research/transformers')
+from modeling_bert import BertReverseLayer, BertReverseAttention
 from transformers.utils import get_full_repo_name
 from transformers.utils.versions import require_version
 
@@ -362,6 +366,8 @@ def main():
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
+    # REVERSE ATTENTION LAYERS
+    # config.reverse_layers = [0]
 
     tokenizer_name_or_path = args.tokenizer_name if args.tokenizer_name else args.model_name_or_path
     if not tokenizer_name_or_path:
@@ -408,6 +414,42 @@ def main():
     model.config.label2id = {l: i for i, l in enumerate(label_list)}
     model.config.id2label = {i: l for i, l in enumerate(label_list)}
 
+    encoder = model.bert.encoder
+    revised_modulelist = []
+    # import pdb; pdb.set_trace()
+
+     # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
+            accelerator.print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
+            accelerator.load_state(args.resume_from_checkpoint)
+            resume_step = None
+            path = args.resume_from_checkpoint
+        else:
+            # Get the most recent checkpoint
+            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
+            dirs.sort(key=os.path.getctime)
+            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
+        if "epoch" in path:
+            args.num_train_epochs -= int(path.replace("epoch_", ""))
+        else:
+            resume_step = int(path.replace("step_", ""))
+            args.num_train_epochs -= resume_step // len(train_dataloader)
+            resume_step = (args.num_train_epochs * len(train_dataloader)) - resume_step
+
+    # config.reverse_layers = [0]
+    # trainable_names = []
+    # for idx, layer in enumerate(encoder.layer):
+        
+    #     if idx in config.reverse_layers:
+    #         layer.attention = BertReverseAttention(config)
+    #         trainable_names += [f'bert.encoder.layer.{idx}.attention.' + i[0] for i in layer.attention.named_parameters()]
+    #     revised_modulelist.append(layer)
+    
+
+
+    encoder.layer = nn.ModuleList(revised_modulelist)
+    print(model)
     # Map that sends B-Xxx label to its I-Xxx counterpart
     b_to_i_label = []
     for idx, label in enumerate(label_list):
@@ -468,6 +510,7 @@ def main():
 
     train_dataset = processed_raw_datasets["train"]
     eval_dataset = processed_raw_datasets["validation"]
+    test_dataset = processed_raw_datasets['test']
 
     # Log a few random samples from the training set:
     for index in random.sample(range(len(train_dataset)), 3):
@@ -490,20 +533,23 @@ def main():
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    test_dataloader = DataLoader(test_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "LayerNorm.weight"]
+    # pdb.set_trace()
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],# and n in trainable_names],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],# and n in trainable_names],
             "weight_decay": 0.0,
         },
     ]
+    # pdb.set_trace()
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Use the device given by the `accelerator` object.
@@ -525,8 +571,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader, test_dataloader, lr_scheduler
     )
 
     # Figure out how many steps we should save the Accelerator states
@@ -543,6 +589,7 @@ def main():
 
     # Metrics
     metric = load_metric("seqeval")
+    test_metric = load_metric("seqeval")
 
     def get_labels(predictions, references):
         # Transform predictions and references tensos to numpy arrays
@@ -564,7 +611,7 @@ def main():
         ]
         return true_predictions, true_labels
 
-    def compute_metrics():
+    def compute_metrics(metric):
         results = metric.compute()
         if args.return_entity_level_metrics:
             # Unpack nested dictionaries
@@ -597,25 +644,10 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            accelerator.print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
-            accelerator.load_state(args.resume_from_checkpoint)
-            resume_step = None
-            path = args.resume_from_checkpoint
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-        if "epoch" in path:
-            args.num_train_epochs -= int(path.replace("epoch_", ""))
-        else:
-            resume_step = int(path.replace("step_", ""))
-            args.num_train_epochs -= resume_step // len(train_dataloader)
-            resume_step = (args.num_train_epochs * len(train_dataloader)) - resume_step
 
+    best_valid_metrics = {'f1': 0.0, 'precision': 0.0, 'recall': 0.0, 'accuracy': 0.0}
+    test_at_best_valid = {'f1': 0.0, 'precision': 0.0, 'recall': 0.0, 'accuracy': 0.0}
+    best_epoch = 0
     for epoch in range(args.num_train_epochs):
         model.train()
         if args.with_tracking:
@@ -624,6 +656,7 @@ def main():
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == 0 and step < resume_step:
                 continue
+            # pdb.set_trace()
             outputs = model(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
@@ -666,8 +699,39 @@ def main():
                 references=refs,
             )  # predictions and preferences are expected to be a nested list of labels, not label_ids
 
-        eval_metric = compute_metrics()
+        eval_metric = compute_metrics(metric)
         accelerator.print(f"epoch {epoch}:", eval_metric)
+
+        for step, batch in enumerate(test_dataloader):
+            with torch.no_grad():
+                outputs = model(**batch)
+            predictions = outputs.logits.argmax(dim=-1)
+            labels = batch["labels"]
+            if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
+                predictions = accelerator.pad_across_processes(predictions, dim=1, pad_index=-100)
+                labels = accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+
+            predictions_gathered = accelerator.gather(predictions)
+            labels_gathered = accelerator.gather(labels)
+            preds, refs = get_labels(predictions_gathered, labels_gathered)
+            test_metric.add_batch(
+                predictions=preds,
+                references=refs,
+            )  # predictions and preferences are expected to be a nested list of labels, not label_ids
+
+        test_metrics = compute_metrics(test_metric)
+
+        if eval_metric['f1'] > best_valid_metrics['f1']:
+            best_valid_metrics = eval_metric
+            test_at_best_valid = test_metrics
+            best_epoch = epoch
+        
+        print('-'*80)
+        print('Best Epoch: {}'.format(best_epoch))
+        print('Best Valid Metrics: {}'.format(best_valid_metrics))
+        print('Best Test Metrics: {}'.format(test_at_best_valid))
+        print('-'*80)
+        
         if args.with_tracking:
             accelerator.log(
                 {
